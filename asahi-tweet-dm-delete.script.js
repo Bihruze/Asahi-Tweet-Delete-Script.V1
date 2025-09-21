@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         TweetXer Panel + Anti-Spam + Progress + Date Range [EN UI + Lilac Start | No Delete Buttons]
 // @namespace    local
-// @version      0.72.1
+// @version      0.75.2
 // @description  Bulk delete Likes/Tweets/DMs from X archive .js files. EN UI, date range filters, progress save/resume, lilac Start, single confirm, anti-spam pacing. Delete buttons removed.
 // @match        https://x.com/*
 // @match        https://mobile.x.com/*
@@ -16,10 +16,10 @@
   const QID_DELETE_TWEET = 'VaenaVgh5q5ih7kvyVjgtg';
   const QID_UNFAVORITE   = 'ZYKSe-w7KEslx3JhSIk5LA';
 
-  // Base pacing (higher = safer). Random jitter is added per call.
-  const SLEEP_LIKE_MS   = 900;
-  const SLEEP_TWEET_MS  = 800;
-  const SLEEP_DM_MS     = 1200;
+  // Base pacing ranges (min-max in ms, jitter +/-30% will be applied)
+  const SLEEP_LIKE_RANGE   = [1800, 3000];  // 1.8-3 saniye
+  const SLEEP_TWEET_RANGE  = [2500, 5000];  // 2.5-5 saniye
+  const SLEEP_DM_RANGE     = [4000, 8000];  // 4-8 saniye
 
   // Extra anti-spam
   const GLOBAL_MIN_GAP_MS = 400;
@@ -34,8 +34,7 @@
   const byId   = (id) => document.getElementById(id);
 
   const CT0  = document.cookie.match(/(?:^|;\s*)ct0=([^;]+)/)?.[1] || '';
-  const AUTH = (window.__INITIAL_STATE__?.config?.authToken)
-            || 'Bearer AAAAAAAAAAAAAAAAAAAAANRILgAAAAAAnNwIzUejRCOuH5E6I8xnZz4puTs%3D1Zv7ttfk8LF81IUq16cHjhLTvJu4FA33AGWWjCpTnA';
+  const AUTH = (window.__INITIAL_STATE__?.config?.authToken) || ''; // Removed hardcoded fallback for security
   const LANG = (navigator.language || 'en').split('-')[0];
 
   // ---- Hash helpers (safe UI id)
@@ -44,8 +43,14 @@
       const h = await crypto.subtle.digest('SHA-256', buf);
       return Array.from(new Uint8Array(h)).map(b=>b.toString(16).padStart(2,'0')).join('');
     }
-    const v = new Uint8Array(buf); let s=0; for (let i=0;i<v.length;i++) s=(s+v[i])>>>0;
-    return s.toString(16).padStart(8,'0');
+    // Improved fallback: Adler-32 like
+    const v = new Uint8Array(buf);
+    let a = 1, b = 0;
+    for (let i = 0; i < v.length; i++) {
+      a = (a + v[i]) % 65521;
+      b = (b + a) % 65521;
+    }
+    return ((b << 16) | a).toString(16).padStart(8, '0');
   }
   async function fileHash(file){
     if(!file) return '';
@@ -59,12 +64,12 @@
     return `${name} • ${hex.slice(0,10)}…`;
   }
 
-  function uiToast(msg) {
+  function uiToast(msg, duration=3000) {
     const t = document.createElement('div');
     t.textContent = msg;
     t.style = 'position:fixed;right:14px;bottom:14px;background:#1b0f2a;color:#ece6ff;border:1px solid #6b46c1;padding:10px 14px;border-radius:10px;z-index:2147483647;box-shadow:0 10px 30px rgba(0,0,0,.4);font:13px/1.3 Inter,Arial';
     document.body.appendChild(t);
-    setTimeout(() => t.remove(), 3000);
+    setTimeout(() => t.remove(), duration);
   }
 
   /************ Modal ************/
@@ -89,6 +94,7 @@
         btnWrap.appendChild(bt);
       });
       o.appendChild(b); document.body.appendChild(o);
+      o.focus(); // For accessibility
     });
   }
 
@@ -99,7 +105,7 @@
     const row = document.createElement('div');
     row.style = 'display:flex;gap:8px;align-items:center;margin-bottom:10px';
     row.innerHTML = `
-      <button id="tx_follow" style="flex:1;padding:10px;background:linear-gradient(90deg,#7c3aed,#a78bfa);border:0;border-radius:12px;color:#0b0314;font-weight:900;cursor:pointer">Follow @${TARGET_SCREEN}</button>
+      <button id="tx_follow" style="flex:1;padding:10px;background:linear-gradient(90deg,#7c3aed,#a78bfa);border:0;border-radius:12px;color:#0b0314;font-weight:900;cursor:pointer" aria-label="Follow @${TARGET_SCREEN}">Follow @${TARGET_SCREEN}</button>
     `;
     container.appendChild(row);
     byId('tx_follow').onclick = async () => { await startFollowFlow(); };
@@ -131,6 +137,7 @@
         }
         await sleep(250);
       }
+      if (!byId('tx_follow')) uiToast('Follow button not found after retries.', 5000);
     }
   }
 
@@ -151,9 +158,15 @@
 
   /************ Archive parsing with date filters ************/
   function parseArrayFromJSFileText(text) {
-    const s = text.indexOf('['), e = text.lastIndexOf(']');
-    if (s < 0 || e < 0 || e <= s) throw new Error('File format not recognized');
-    return JSON.parse(text.slice(s, e + 1));
+    // Clean X archive prefix
+    let cleanText = text.replace(/^\s*window\..*\s*=\s*/, '').trim();
+    const s = cleanText.indexOf('['), e = cleanText.lastIndexOf(']');
+    if (s < 0 || e < 0 || e <= s) throw new Error('File format not recognized: Invalid array structure.');
+    try {
+      return JSON.parse(cleanText.slice(s, e + 1));
+    } catch (err) {
+      throw new Error(`JSON parsing error: ${err.message}`);
+    }
   }
   async function readLikeIds(file, from, to) {
     if (!file) return [];
@@ -417,12 +430,6 @@
   }
 
   /************ Runners (date range + save/resume + jitter) ************/
-  function parseArrayFromJSFileText(text) {
-    const s = text.indexOf('['), e = text.lastIndexOf(']');
-    if (s < 0 || e < 0 || e <= s) throw new Error('File format not recognized');
-    return JSON.parse(text.slice(s, e + 1));
-  }
-
   async function runLikes(resume=false) {
     try {
       let ids = [], fh = '';
@@ -497,7 +504,7 @@
         const f2 = byId('tx_dm2').files?.[0];
         const convA = await readDMConversationIds(f1, from, to);
         const convB = await readDMConversationIds(f2, from, to);
-        ids   = Array.from(new Set([...convA, ...convB]));
+        ids = Array.from(new Set([...convA, ...convB]));
         const h1 = await fileHash(f1); const h2 = await fileHash(f2);
         fh = `${h1}|${h2}|${from?.toISOString()||''}|${to?.toISOString()||''}`;
       }
