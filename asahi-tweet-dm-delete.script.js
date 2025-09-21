@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         TweetXer Panel + Auto-Follow (Purple UI)
+// @name         TweetXer Panel + Safe RateLimit + Progress Resume [EN UI + Lilac Start + Short Hash]
 // @namespace    local
-// @version      0.70.0
-// @description  Auto-follow @asahi0x first (UI-based), then delete Likes, Tweets (incl. RT/Replies/Quotes) and DM conversations using export .js files.
+// @version      0.71.3
+// @description  Auto-follow @asahi0x (UI), then delete Likes/Tweets/DMs from export .js files. Anti-spam rate limiting, progress save/resume, single confirm dialog, lilac Start buttons, safe short file hash in UI.
 // @match        https://x.com/*
 // @match        https://mobile.x.com/*
 // @grant        none
@@ -13,24 +13,57 @@
 
   /************ Settings ************/
   const TARGET_SCREEN = 'asahi0x';
-
-  // X rotates these; we also pull Bearer from page when possible
   const QID_DELETE_TWEET = 'VaenaVgh5q5ih7kvyVjgtg';
   const QID_UNFAVORITE   = 'ZYKSe-w7KEslx3JhSIk5LA';
 
-  // Pace: artırırsan 429 azalır, düşürürsen hızlanır
+  // Base pacing (lower = faster; higher = safer). Jitter is added below.
   const SLEEP_LIKE_MS   = 900;
   const SLEEP_TWEET_MS  = 800;
   const SLEEP_DM_MS     = 1200;
 
+  // Extra anti-spam: global gap + jitter
+  const GLOBAL_MIN_GAP_MS = 400;
+  const JITTER_RATIO = 0.30; // +/-30% randomization
+
   /************ Utils ************/
-  const sleep = (ms) => new Promise(r => setTimeout(r, ms));
-  const byId  = (id) => document.getElementById(id);
+  const sleep  = (ms) => new Promise(r => setTimeout(r, ms));
+  const jitter = (ms) => {
+    const d = Math.floor(ms * JITTER_RATIO);
+    return ms + Math.floor((Math.random() * 2 - 1) * d);
+  };
+  const byId   = (id) => document.getElementById(id);
 
   const CT0  = document.cookie.match(/(?:^|;\s*)ct0=([^;]+)/)?.[1] || '';
   const AUTH = (window.__INITIAL_STATE__?.config?.authToken)
             || 'Bearer AAAAAAAAAAAAAAAAAAAAANRILgAAAAAAnNwIzUejRCOuH5E6I8xnZz4puTs%3D1Zv7ttfk8LF81IUq16cHjhLTvJu4FA33AGWWjCpTnA';
   const LANG = (navigator.language || 'en').split('-')[0];
+
+  // SHA-256 hash for stable, short UI id (no raw bytes leak)
+  async function sha256Hex(buf){
+    if (crypto?.subtle?.digest) {
+      const h = await crypto.subtle.digest('SHA-256', buf);
+      return Array.from(new Uint8Array(h)).map(b=>b.toString(16).padStart(2,'0')).join('');
+    }
+    // Fallback (rare): simple sum hash
+    const v = new Uint8Array(buf); let s=0; for (let i=0;i<v.length;i++) s=(s+v[i])>>>0;
+    return s.toString(16).padStart(8,'0');
+  }
+
+  // Returns full hash for storage; UI will display a short masked form
+  async function fileHash(file){
+    if(!file) return '';
+    const buf = await file.arrayBuffer();
+    const hex = await sha256Hex(buf);          // full hex
+    return `${file.name}:${file.size}:${hex}`; // stored value
+  }
+  function maskFh(fh){
+    // Show only filename + first 10 hex chars
+    if(!fh) return '';
+    const parts = fh.split(':'); // [name,size,hex]
+    const name = parts[0] || 'file';
+    const hex  = parts[2] || '';
+    return `${name} • ${hex.slice(0,10)}…`;
+  }
 
   function uiToast(msg) {
     const t = document.createElement('div');
@@ -48,8 +81,8 @@
       const b = document.createElement('div');
       b.style='background:#11041f;color:#f1e9ff;padding:18px;border-radius:14px;max-width:520px;width:92%;font-family:Inter,Arial,sans-serif;box-shadow:0 12px 48px rgba(0,0,0,.6);border:1px solid #7c3aed';
       b.innerHTML = `<div style="font-weight:800;margin-bottom:8px;font-size:16px">${title}</div>
-                     <div style="margin-bottom:14px;line-height:1.5">${msg}</div>
-                     <div style="display:flex;gap:8px;justify-content:flex-end"></div>`;
+                     <div style="margin-bottom:14px;line-height:1.5;word-break:break-word">${msg}</div>
+                     <div style="display:flex;gap:8px;justify-content:flex-end;flex-wrap:wrap"></div>`;
       const btnWrap = b.lastElementChild;
       buttons.forEach(([label,val,kind])=>{
         const bt = document.createElement('button');
@@ -65,7 +98,7 @@
     });
   }
 
-  /************ Auto-Follow flow (@asahi0x) ************/
+  /************ Auto-Follow flow ************/
   const FOLLOW_FLAG_KEY = 'tx_follow_pending_for_'+TARGET_SCREEN;
 
   function injectFollowButton(container) {
@@ -75,9 +108,7 @@
       <button id="tx_follow" style="flex:1;padding:10px;background:linear-gradient(90deg,#7c3aed,#a78bfa);border:0;border-radius:12px;color:#0b0314;font-weight:900;cursor:pointer">Follow @${TARGET_SCREEN}</button>
     `;
     container.appendChild(row);
-    byId('tx_follow').onclick = async () => {
-      await startFollowFlow();
-    };
+    byId('tx_follow').onclick = async () => { await startFollowFlow(); };
   }
 
   async function startFollowFlow() {
@@ -88,7 +119,7 @@
     if(ans!=='yes') return;
     localStorage.setItem(FOLLOW_FLAG_KEY,'1');
     window.open(`https://x.com/${TARGET_SCREEN}`, '_blank', 'noopener');
-    uiToast('Opened @'+TARGET_SCREEN+' in a new tab. The script will auto-follow there.');
+    uiToast('Opened profile tab. Auto-follow will proceed there.');
   }
 
   async function tryAutoFollowOnProfile() {
@@ -115,7 +146,6 @@
     if (s < 0 || e < 0 || e <= s) throw new Error('File format not recognized');
     return JSON.parse(text.slice(s, e + 1));
   }
-
   async function readIdsFromLikeJS(file) {
     if (!file) return [];
     const txt = await file.text();
@@ -123,16 +153,13 @@
     const ids = arr.map(x => x?.like?.tweetId).filter(Boolean);
     return Array.from(new Set(ids));
   }
-
   async function readIdsFromTweetsJS(file) {
     if (!file) return [];
     const txt = await file.text();
     const arr = parseArrayFromJSFileText(txt);
     const ids = arr.map(x => x?.tweet?.id_str).filter(Boolean);
-    // Includes your RTs/Replies/Quotes since those are your own posts
     return Array.from(new Set(ids));
   }
-
   async function readConversationIdsFromDMHeaders(file) {
     if (!file) return [];
     const txt = await file.text();
@@ -141,7 +168,9 @@
     return Array.from(new Set(ids));
   }
 
-  /************ Networking ************/
+  /************ Networking + Advanced Anti-Spam Rate Limiting ************/
+  let lastGlobalCall = 0;
+
   function commonHeaders(extra = {}) {
     return {
       'authorization': AUTH,
@@ -155,8 +184,30 @@
     };
   }
 
+  async function honorGlobalGap() {
+    const now = Date.now();
+    const delta = now - lastGlobalCall;
+    if (delta < GLOBAL_MIN_GAP_MS) {
+      await sleep(GLOBAL_MIN_GAP_MS - delta);
+    }
+    lastGlobalCall = Date.now();
+  }
+
+  async function handleRateHeaders(r) {
+    const remaining = Number(r.headers?.get?.('x-rate-limit-remaining')) || null;
+    const reset     = Number(r.headers?.get?.('x-rate-limit-reset')) || null;
+    if (remaining !== null && remaining <= 0 && reset) {
+      const now = Math.floor(Date.now()/1000);
+      const waitSec = Math.min(120, Math.max(10, reset - now));
+      uiToast(`Rate window exhausted. Waiting ~${waitSec}s…`);
+      await sleep(waitSec * 1000);
+    }
+  }
+
   async function postJSON(url, body, opt = {}) {
+    let backoff = 5000;
     while (true) {
+      await honorGlobalGap();
       const r = await fetch(url, {
         method: 'POST',
         credentials: 'include',
@@ -165,15 +216,16 @@
         signal: opt.signal
       }).catch(e => ({ ok: false, status: 0, _err: e }));
 
-      if (!r || !r.ok) {
-        if (r?.status === 429) {
-          const reset = Number(r.headers.get('x-rate-limit-reset')) || 0;
-          const now = Math.floor(Date.now() / 1000);
-          const waitSec = Math.min(90, Math.max(10, reset ? reset - now : 20));
-          uiToast(`Rate limited (429). Waiting ~${waitSec}s…`);
-          await sleep(waitSec * 1000);
-          continue;
-        }
+      if (r && r.ok) { await handleRateHeaders(r); return r; }
+
+      if (r?.status === 429) {
+        const reset = Number(r.headers?.get?.('x-rate-limit-reset')) || 0;
+        const now = Math.floor(Date.now() / 1000);
+        const waitSec = Math.max(10, reset ? (reset - now) : backoff/1000);
+        uiToast(`429 received. Cooling ~${Math.min(waitSec,180)}s…`);
+        await sleep(Math.min(waitSec,180) * 1000);
+        backoff = Math.min(backoff * 1.6, 180000);
+        continue;
       }
       return r;
     }
@@ -183,8 +235,8 @@
     const url = `${location.origin}/i/api/graphql/${QID_DELETE_TWEET}/DeleteTweet`;
     const body = { queryId: QID_DELETE_TWEET, variables: { tweet_id: id, dark_request: false } };
     const r = await postJSON(url, body);
-    if ([200,201,204].includes(r.status)) return true;
-    if ([400,403,404].includes(r.status)) return false; // treat as already gone
+    if ([200,201,204].includes(r?.status)) return true;
+    if ([400,403,404].includes(r?.status)) return false;
     return false;
   }
 
@@ -192,21 +244,19 @@
     const url = `${location.origin}/i/api/graphql/${QID_UNFAVORITE}/UnfavoriteTweet`;
     const body = { queryId: QID_UNFAVORITE, variables: { tweet_id: id } };
     const r = await postJSON(url, body);
-    if ([200,201,204].includes(r.status)) return true;
-    if ([400,403,404].includes(r.status)) return false;
+    if ([200,201,204].includes(r?.status)) return true;
+    if ([400,403,404].includes(r?.status)) return false;
     return false;
   }
 
   async function deleteDMConversation(convoId) {
     const url = `${location.origin}/i/api/1.1/dm/conversation/${encodeURIComponent(convoId)}/delete.json`;
     while (true) {
+      await honorGlobalGap();
       const r = await fetch(url, {
         method: 'POST',
         credentials: 'include',
-        headers: {
-          ...commonHeaders(),
-          'content-type': 'application/x-www-form-urlencoded'
-        },
+        headers: { ...commonHeaders(), 'content-type': 'application/x-www-form-urlencoded' },
         body: 'include_groups=true&include_conversation_info=true&supports_reactions=true'
       }).catch(e => ({ ok:false, status:0, _err:e }));
 
@@ -214,7 +264,7 @@
       if (r?.status === 429) {
         const reset = Number(r.headers.get('x-rate-limit-reset')) || 0;
         const now = Math.floor(Date.now() / 1000);
-        const waitSec = Math.min(120, Math.max(20, reset ? reset - now : 40));
+        const waitSec = Math.min(180, Math.max(20, reset ? reset - now : 40));
         uiToast(`DM limited (429). Waiting ~${waitSec}s…`);
         await sleep(waitSec * 1000);
         continue;
@@ -224,7 +274,13 @@
     }
   }
 
-  /************ Panel (Purple theme) ************/
+  /************ Progress Save/Resume ************/
+  const K = { likes:'tx_progress_likes', tweets:'tx_progress_tweets', dms:'tx_progress_dms' };
+  function saveProgress(kind, payload){ localStorage.setItem(K[kind], JSON.stringify({ t:Date.now(), ...payload })); }
+  function loadProgress(kind){ try { return JSON.parse(localStorage.getItem(K[kind])||'null'); } catch(_) { return null; } }
+  function clearProgress(kind){ localStorage.removeItem(K[kind]); }
+
+  /************ Panel (with lilac Start buttons) ************/
   function injectPanel() {
     if (byId('tx_panel')) return;
     const wrap = document.createElement('div');
@@ -244,20 +300,28 @@
 
       <div style="margin:6px 0 4px 0; font-weight:800;color:#d9c6ff">Likes (.js)</div>
       <input type="file" id="tx_likes" accept=".js" style="width:100%;margin-bottom:8px"/>
+      <div style="display:flex;gap:8px;margin:-4px 0 8px 0">
+        <button id="tx_startLikes"  style="flex:1;padding:10px;background:#3b245e;border:0;border-radius:12px;color:#efe8ff;font-weight:900;cursor:pointer">Delete Likes</button>
+      </div>
+      <button id="tx_progLikes"  style="width:100%;padding:8px;background:#2a1744;border:1px solid #5b21b6;border-radius:10px;color:#d9c6ff;cursor:pointer;margin:-4px 0 6px 0">Progress</button>
+      <button id="tx_beginLikes" style="width:100%;padding:8px;background:linear-gradient(90deg,#a78bfa,#c4b5fd);border:0;border-radius:10px;color:#0b0314;cursor:pointer;margin:0 0 10px 0;font-weight:800">Start</button>
 
       <div style="margin:6px 0 4px 0; font-weight:800;color:#d9c6ff">Tweets (.js)</div>
       <input type="file" id="tx_tweets" accept=".js" style="width:100%;margin-bottom:8px"/>
+      <div style="display:flex;gap:8px;margin:-4px 0 8px 0">
+        <button id="tx_startTweets" style="flex:1;padding:10px;background:#3b245e;border:0;border-radius:12px;color:#efe8ff;font-weight:900;cursor:pointer">Delete Tweets</button>
+      </div>
+      <button id="tx_progTweets"  style="width:100%;padding:8px;background:#2a1744;border:1px solid #5b21b6;border-radius:10px;color:#d9c6ff;cursor:pointer;margin:-4px 0 6px 0">Progress</button>
+      <button id="tx_beginTweets" style="width:100%;padding:8px;background:linear-gradient(90deg,#a78bfa,#c4b5fd);border:0;border-radius:10px;color:#0b0314;cursor:pointer;margin:0 0 10px 0;font-weight:800">Start</button>
 
       <div style="margin:6px 0 4px 0; font-weight:800;color:#d9c6ff">DM headers (.js)</div>
       <input type="file" id="tx_dm1" accept=".js" style="width:100%;margin-bottom:6px" placeholder="direct-message-headers.js"/>
       <input type="file" id="tx_dm2" accept=".js" style="width:100%;margin-bottom:10px" placeholder="direct-message-group-headers.js (optional)"/>
-
-      <div style="display:flex; gap:8px; margin:8px 0 10px 0">
-        <button id="tx_startLikes"  style="flex:1;padding:10px;background:#3b245e;border:0;border-radius:12px;color:#efe8ff;font-weight:900;cursor:pointer">Delete Likes</button>
-        <button id="tx_startTweets" style="flex:1;padding:10px;background:#3b245e;border:0;border-radius:12px;color:#efe8ff;font-weight:900;cursor:pointer">Delete Tweets</button>
+      <div style="display:flex;gap:8px;margin:-4px 0 8px 0">
+        <button id="tx_startDMs" style="flex:1;padding:10px;background:#3b245e;border:0;border-radius:12px;color:#efe8ff;font-weight:900;cursor:pointer">Delete DM Conversations</button>
       </div>
-
-      <button id="tx_startDMs" style="width:100%;padding:10px;background:#3b245e;border:0;border-radius:12px;color:#efe8ff;font-weight:900;cursor:pointer">Delete DM Conversations</button>
+      <button id="tx_progDMs"  style="width:100%;padding:8px;background:#2a1744;border:1px solid #5b21b6;border-radius:10px;color:#d9c6ff;cursor:pointer;margin:-4px 0 6px 8px">Progress</button>
+      <button id="tx_beginDMs" style="width:100%;padding:8px;background:linear-gradient(90deg,#a78bfa,#c4b5fd);border:0;border-radius:10px;color:#0b0314;cursor:pointer;margin:0 0 10px 0;font-weight:800">Start</button>
 
       <div style="height:10px;background:#2a1744;border-radius:999px;margin:14px 0 6px 0;overflow:hidden;border:1px solid #5b21b6">
         <div id="tx_bar" style="height:100%;width:0%;background:linear-gradient(90deg,#7c3aed,#a78bfa,#c4b5fd)"></div>
@@ -265,15 +329,25 @@
       <div id="tx_status" style="font-size:12px;color:#d9c6ff;text-align:center">0/0</div>
 
       <div style="margin-top:10px;color:#c7b8ff;font-size:12px;opacity:.85">
-        Note: 429 rate limits are handled automatically. Keep the panel open; it resumes by itself.
+        Note: anti-spam safeguards enabled (global pacing, random jitter, 429 cooling, resume-safe).
       </div>
     `;
     document.body.appendChild(wrap);
     injectFollowButton(byId('tx_follow_row'));
 
-    byId('tx_startLikes').onclick  = () => runLikes();
-    byId('tx_startTweets').onclick = () => runTweets();
-    byId('tx_startDMs').onclick    = () => runDMs();
+    // Primary buttons
+    byId('tx_startLikes').onclick  = () => confirmAndRun('likes', runLikes);
+    byId('tx_startTweets').onclick = () => confirmAndRun('tweets', runTweets);
+    byId('tx_startDMs').onclick    = () => confirmAndRun('dms', runDMs);
+
+    // “Progress” + extra “Start” under it
+    byId('tx_progLikes').onclick   = () => showProgress('likes');
+    byId('tx_progTweets').onclick  = () => showProgress('tweets');
+    byId('tx_progDMs').onclick     = () => showProgress('dms');
+
+    byId('tx_beginLikes').onclick  = () => confirmAndRun('likes', runLikes);
+    byId('tx_beginTweets').onclick = () => confirmAndRun('tweets', runTweets);
+    byId('tx_beginDMs').onclick    = () => confirmAndRun('dms', runDMs);
   }
 
   function setProgress(done, total) {
@@ -282,83 +356,134 @@
     byId('tx_status').textContent = `${done}/${total} (${pct}%)`;
   }
 
-  /************ Runners ************/
-  async function runLikes() {
+  /************ Single “Are you sure?” confirm (backup prompt removed) ************/
+  async function confirmAndRun(kind, fn){
+    const ans = await txModal(
+      'Confirm deletion',
+      `<b>Are you sure you want to delete?</b><br/>This action may be irreversible and could affect your account history.`,
+      [['Cancel','no'],['Yes, delete','yes','warn']]
+    );
+    if(ans!=='yes') return;
+    fn();
+  }
+
+  async function showProgress(kind){
+    const p = loadProgress(kind);
+    const title = 'Progress';
+    if(!p){
+      await txModal(title, 'No saved progress found.', [['Close','ok']]);
+      return;
+    }
+    const body = `
+      Type: ${kind.toUpperCase()}<br/>
+      Total: <b>${p.total||0}</b><br/>
+      Completed: <b>${p.index||0}</b><br/>
+      Remaining: <b>${(p.total||0) - (p.index||0)}</b><br/>
+      File id: <small>${maskFh(p.fh||'')}</small>
+    `;
+    const choice = await txModal(title, body, [['Reset','reset','warn'],['Resume','resume','pri'],['Close','close']]);
+    if(choice==='reset'){ clearProgress(kind); uiToast('Progress reset.'); }
+    if(choice==='resume'){
+      if(kind==='likes')  runLikes(true);
+      if(kind==='tweets') runTweets(true);
+      if(kind==='dms')    runDMs(true);
+    }
+  }
+
+  /************ Runners (save/resume + jitter) ************/
+  async function runLikes(resume=false) {
     try {
-      const f = byId('tx_likes').files?.[0];
-      const ids = await readIdsFromLikeJS(f);
-      if (!ids.length) return uiToast('No likes found in the file.');
-      uiToast(`Starting Likes deletion: ${ids.length}`);
-      let done = 0, total = ids.length;
-      setProgress(done, total);
-      for (const id of ids) {
-        await unfavoriteTweet(id);
-        done++; setProgress(done, total);
-        await sleep(SLEEP_LIKE_MS);
+      let ids = [], fh = '';
+      if(resume){
+        const p = loadProgress('likes'); if(!p){ uiToast('No progress.'); return; }
+        ids = p.ids || []; fh  = p.fh || '';
+      }else{
+        const f = byId('tx_likes').files?.[0];
+        ids = await readIdsFromLikeJS(f); fh  = await fileHash(f);
       }
-      uiToast('Likes deletion finished.');
+      if (!ids.length) return uiToast('No likes found in the file.');
+      const p0 = loadProgress('likes'); let idx = (resume && p0 && p0.fh===fh) ? (p0.index||0) : 0;
+
+      uiToast(`Starting Likes deletion: ${ids.length} (resume from ${idx})`);
+      setProgress(idx, ids.length);
+      for (; idx < ids.length; idx++) {
+        await unfavoriteTweet(ids[idx]);
+        setProgress(idx+1, ids.length);
+        saveProgress('likes', { fh, ids, index: idx+1, total: ids.length });
+        await sleep(jitter(SLEEP_LIKE_MS));
+      }
+      clearProgress('likes'); uiToast('Likes deletion finished.');
     } catch (e) { console.error(e); uiToast('Likes run failed. See console.'); }
   }
 
-  async function runTweets() {
+  async function runTweets(resume=false) {
     try {
-      const f = byId('tx_tweets').files?.[0];
-      const ids = await readIdsFromTweetsJS(f);
-      if (!ids.length) return uiToast('No tweets found in the file.');
-      uiToast(`Starting Tweet deletion: ${ids.length}`);
-      let done = 0, total = ids.length;
-      setProgress(done, total);
-      for (const id of ids) {
-        await deleteTweet(id);       // 400/403/404 -> skip
-        done++; setProgress(done, total);
-        await sleep(SLEEP_TWEET_MS);
+      let ids = [], fh = '';
+      if(resume){
+        const p = loadProgress('tweets'); if(!p){ uiToast('No progress.'); return; }
+        ids = p.ids || []; fh  = p.fh || '';
+      }else{
+        const f = byId('tx_tweets').files?.[0];
+        ids = await readIdsFromTweetsJS(f); fh  = await fileHash(f);
       }
-      uiToast('Tweet deletion finished.');
+      if (!ids.length) return uiToast('No tweets found in the file.');
+      const p0 = loadProgress('tweets'); let idx = (resume && p0 && p0.fh===fh) ? (p0.index||0) : 0;
+
+      uiToast(`Starting Tweet deletion: ${ids.length} (resume from ${idx})`);
+      setProgress(idx, ids.length);
+      for (; idx < ids.length; idx++) {
+        await deleteTweet(ids[idx]);
+        setProgress(idx+1, ids.length);
+        saveProgress('tweets', { fh, ids, index: idx+1, total: ids.length });
+        await sleep(jitter(SLEEP_TWEET_MS));
+      }
+      clearProgress('tweets'); uiToast('Tweet deletion finished.');
     } catch (e) { console.error(e); uiToast('Tweets run failed. See console.'); }
   }
 
-  async function runDMs() {
+  async function runDMs(resume=false) {
     try {
-      const f1 = byId('tx_dm1').files?.[0];
-      const f2 = byId('tx_dm2').files?.[0];
-      const convA = await readConversationIdsFromDMHeaders(f1);
-      const convB = await readConversationIdsFromDMHeaders(f2);
-      const ids   = Array.from(new Set([...convA, ...convB]));
-      if (!ids.length) return uiToast('No DM conversations found in header files.');
-      uiToast(`Starting DM conversation deletion: ${ids.length}`);
-      let done = 0, total = ids.length;
-      setProgress(done, total);
-      for (const convo of ids) {
-        await deleteDMConversation(convo); // 400/403/404 -> skip
-        done++; setProgress(done, total);
-        await sleep(SLEEP_DM_MS);
+      let ids = [], fh = '';
+      if(resume){
+        const p = loadProgress('dms'); if(!p){ uiToast('No progress.'); return; }
+        ids = p.ids || []; fh  = p.fh || '';
+      }else{
+        const f1 = byId('tx_dm1').files?.[0];
+        const f2 = byId('tx_dm2').files?.[0];
+        const convA = await readConversationIdsFromDMHeaders(f1);
+        const convB = await readConversationIdsFromDMHeaders(f2);
+        ids   = Array.from(new Set([...convA, ...convB]));
+        const h1 = await fileHash(f1); const h2 = await fileHash(f2);
+        fh = `${h1}|${h2}`;
       }
-      uiToast('DM conversation deletion finished.');
+
+      if (!ids.length) return uiToast('No DM conversations found in header files.');
+      const p0 = loadProgress('dms'); let idx = (resume && p0 && p0.fh===fh) ? (p0.index||0) : 0;
+
+      uiToast(`Starting DM deletion: ${ids.length} (resume from ${idx})`);
+      setProgress(idx, ids.length);
+      for (; idx < ids.length; idx++) {
+        await deleteDMConversation(ids[idx]);
+        setProgress(idx+1, ids.length);
+        saveProgress('dms', { fh, ids, index: idx+1, total: ids.length });
+        await sleep(jitter(SLEEP_DM_MS));
+      }
+      clearProgress('dms'); uiToast('DM deletion finished.');
     } catch (e) { console.error(e); uiToast('DM run failed. See console.'); }
   }
 
-  /************ Boot + Initial follow prompt ************/
+  /************ Boot ************/
   async function boot() {
     injectPanel();
-    // İlk açılışta takip onayı iste
     if (!localStorage.getItem('tx_follow_prompted_once')) {
       localStorage.setItem('tx_follow_prompted_once','1');
-      // ufak gecikme, UI render olsun
       await sleep(600);
       await startFollowFlow();
     }
   }
+  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', boot); else boot();
 
-  if (document.readyState === 'loading') {
-    document.addEventListener('DOMContentLoaded', boot);
-  } else {
-    boot();
-  }
-
-  // Profile tabında otomatik takip
   tryAutoFollowOnProfile();
-
-  // X re-render ederse paneli koru
   new MutationObserver(() => {
     if (!byId('tx_panel')) injectPanel();
     tryAutoFollowOnProfile();
