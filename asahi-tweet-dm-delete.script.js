@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         TweetXer Panel + Safe RateLimit + Progress Resume [EN UI + Lilac Start + Short Hash]
+// @name         TweetXer Panel + Anti-Spam + Progress + Date Range [EN UI + Lilac Start | No Delete Buttons]
 // @namespace    local
-// @version      0.71.3
-// @description  Auto-follow @asahi0x (UI), then delete Likes/Tweets/DMs from export .js files. Anti-spam rate limiting, progress save/resume, single confirm dialog, lilac Start buttons, safe short file hash in UI.
+// @version      0.72.1
+// @description  Bulk delete Likes/Tweets/DMs from X archive .js files. EN UI, date range filters, progress save/resume, lilac Start, single confirm, anti-spam pacing. Delete buttons removed.
 // @match        https://x.com/*
 // @match        https://mobile.x.com/*
 // @grant        none
@@ -16,14 +16,14 @@
   const QID_DELETE_TWEET = 'VaenaVgh5q5ih7kvyVjgtg';
   const QID_UNFAVORITE   = 'ZYKSe-w7KEslx3JhSIk5LA';
 
-  // Base pacing (lower = faster; higher = safer). Jitter is added below.
+  // Base pacing (higher = safer). Random jitter is added per call.
   const SLEEP_LIKE_MS   = 900;
   const SLEEP_TWEET_MS  = 800;
   const SLEEP_DM_MS     = 1200;
 
-  // Extra anti-spam: global gap + jitter
+  // Extra anti-spam
   const GLOBAL_MIN_GAP_MS = 400;
-  const JITTER_RATIO = 0.30; // +/-30% randomization
+  const JITTER_RATIO = 0.30; // +/-30%
 
   /************ Utils ************/
   const sleep  = (ms) => new Promise(r => setTimeout(r, ms));
@@ -38,30 +38,24 @@
             || 'Bearer AAAAAAAAAAAAAAAAAAAAANRILgAAAAAAnNwIzUejRCOuH5E6I8xnZz4puTs%3D1Zv7ttfk8LF81IUq16cHjhLTvJu4FA33AGWWjCpTnA';
   const LANG = (navigator.language || 'en').split('-')[0];
 
-  // SHA-256 hash for stable, short UI id (no raw bytes leak)
+  // ---- Hash helpers (safe UI id)
   async function sha256Hex(buf){
     if (crypto?.subtle?.digest) {
       const h = await crypto.subtle.digest('SHA-256', buf);
       return Array.from(new Uint8Array(h)).map(b=>b.toString(16).padStart(2,'0')).join('');
     }
-    // Fallback (rare): simple sum hash
     const v = new Uint8Array(buf); let s=0; for (let i=0;i<v.length;i++) s=(s+v[i])>>>0;
     return s.toString(16).padStart(8,'0');
   }
-
-  // Returns full hash for storage; UI will display a short masked form
   async function fileHash(file){
     if(!file) return '';
     const buf = await file.arrayBuffer();
-    const hex = await sha256Hex(buf);          // full hex
-    return `${file.name}:${file.size}:${hex}`; // stored value
+    const hex = await sha256Hex(buf);
+    return `${file.name}:${file.size}:${hex}`;
   }
   function maskFh(fh){
-    // Show only filename + first 10 hex chars
     if(!fh) return '';
-    const parts = fh.split(':'); // [name,size,hex]
-    const name = parts[0] || 'file';
-    const hex  = parts[2] || '';
+    const [name,,hex=''] = fh.split(':');
     return `${name} • ${hex.slice(0,10)}…`;
   }
 
@@ -140,35 +134,69 @@
     }
   }
 
-  /************ Archive parsing ************/
+  /************ Date helpers ************/
+  function parseMaybeDate(v){
+    if(!v) return null;
+    if (/^\d{13}$/.test(v)) return new Date(Number(v));       // ms
+    if (/^\d{10}$/.test(v))  return new Date(Number(v)*1000); // sec
+    const d = new Date(v);
+    return isNaN(d.getTime()) ? null : d;
+  }
+  function inRange(date, from, to){
+    if(!date) return false;
+    if(from && date < from) return false;
+    if(to   && date > to)   return false;
+    return true;
+  }
+
+  /************ Archive parsing with date filters ************/
   function parseArrayFromJSFileText(text) {
     const s = text.indexOf('['), e = text.lastIndexOf(']');
     if (s < 0 || e < 0 || e <= s) throw new Error('File format not recognized');
     return JSON.parse(text.slice(s, e + 1));
   }
-  async function readIdsFromLikeJS(file) {
+  async function readLikeIds(file, from, to) {
     if (!file) return [];
     const txt = await file.text();
     const arr = parseArrayFromJSFileText(txt);
-    const ids = arr.map(x => x?.like?.tweetId).filter(Boolean);
-    return Array.from(new Set(ids));
+    const out = [];
+    for (const x of arr) {
+      const id = x?.like?.tweetId;
+      const d  = parseMaybeDate(x?.like?.createdAt);
+      if (id && (!from && !to || inRange(d, from, to))) out.push(id);
+    }
+    return Array.from(new Set(out));
   }
-  async function readIdsFromTweetsJS(file) {
+  async function readTweetIds(file, from, to) {
     if (!file) return [];
     const txt = await file.text();
     const arr = parseArrayFromJSFileText(txt);
-    const ids = arr.map(x => x?.tweet?.id_str).filter(Boolean);
-    return Array.from(new Set(ids));
+    const out = [];
+    for (const x of arr) {
+      const id = x?.tweet?.id_str || x?.tweet?.id;
+      const d  = parseMaybeDate(x?.tweet?.created_at || x?.tweet?.createdAt);
+      if (id && (!from && !to || inRange(d, from, to))) out.push(String(id));
+    }
+    return Array.from(new Set(out));
   }
-  async function readConversationIdsFromDMHeaders(file) {
+  async function readDMConversationIds(file, from, to) {
     if (!file) return [];
     const txt = await file.text();
     const arr = parseArrayFromJSFileText(txt);
-    const ids = arr.map(x => x?.dmConversation?.conversationId).filter(Boolean);
-    return Array.from(new Set(ids));
+    const out = [];
+    for (const x of arr) {
+      const id = x?.dmConversation?.conversationId;
+      const d  = parseMaybeDate(
+        x?.dmConversation?.createdAt ||
+        x?.dmConversation?.lastReadEventTimestamp ||
+        x?.dmConversation?.sortTimestamp
+      );
+      if (id && (!from && !to || inRange(d, from, to))) out.push(id);
+    }
+    return Array.from(new Set(out));
   }
 
-  /************ Networking + Advanced Anti-Spam Rate Limiting ************/
+  /************ Networking + Anti-Spam ************/
   let lastGlobalCall = 0;
 
   function commonHeaders(extra = {}) {
@@ -187,9 +215,7 @@
   async function honorGlobalGap() {
     const now = Date.now();
     const delta = now - lastGlobalCall;
-    if (delta < GLOBAL_MIN_GAP_MS) {
-      await sleep(GLOBAL_MIN_GAP_MS - delta);
-    }
+    if (delta < GLOBAL_MIN_GAP_MS) await sleep(GLOBAL_MIN_GAP_MS - delta);
     lastGlobalCall = Date.now();
   }
 
@@ -239,7 +265,6 @@
     if ([400,403,404].includes(r?.status)) return false;
     return false;
   }
-
   async function unfavoriteTweet(id) {
     const url = `${location.origin}/i/api/graphql/${QID_UNFAVORITE}/UnfavoriteTweet`;
     const body = { queryId: QID_UNFAVORITE, variables: { tweet_id: id } };
@@ -248,7 +273,6 @@
     if ([400,403,404].includes(r?.status)) return false;
     return false;
   }
-
   async function deleteDMConversation(convoId) {
     const url = `${location.origin}/i/api/1.1/dm/conversation/${encodeURIComponent(convoId)}/delete.json`;
     while (true) {
@@ -280,7 +304,7 @@
   function loadProgress(kind){ try { return JSON.parse(localStorage.getItem(K[kind])||'null'); } catch(_) { return null; } }
   function clearProgress(kind){ localStorage.removeItem(K[kind]); }
 
-  /************ Panel (with lilac Start buttons) ************/
+  /************ Panel (Delete buttons removed) ************/
   function injectPanel() {
     if (byId('tx_panel')) return;
     const wrap = document.createElement('div');
@@ -298,30 +322,36 @@
 
       <div id="tx_follow_row"></div>
 
+      <!-- Likes -->
       <div style="margin:6px 0 4px 0; font-weight:800;color:#d9c6ff">Likes (.js)</div>
-      <input type="file" id="tx_likes" accept=".js" style="width:100%;margin-bottom:8px"/>
-      <div style="display:flex;gap:8px;margin:-4px 0 8px 0">
-        <button id="tx_startLikes"  style="flex:1;padding:10px;background:#3b245e;border:0;border-radius:12px;color:#efe8ff;font-weight:900;cursor:pointer">Delete Likes</button>
+      <input type="file" id="tx_likes" accept=".js" style="width:100%;margin-bottom:6px"/>
+      <div style="display:flex;gap:6px;margin:2px 0 8px 0">
+        <input type="date" id="tx_likeFrom" style="flex:1;background:#1a1030;color:#eee;border:1px solid #5b21b6;border-radius:8px;padding:6px"/>
+        <input type="date" id="tx_likeTo"   style="flex:1;background:#1a1030;color:#eee;border:1px solid #5b21b6;border-radius:8px;padding:6px"/>
       </div>
-      <button id="tx_progLikes"  style="width:100%;padding:8px;background:#2a1744;border:1px solid #5b21b6;border-radius:10px;color:#d9c6ff;cursor:pointer;margin:-4px 0 6px 0">Progress</button>
-      <button id="tx_beginLikes" style="width:100%;padding:8px;background:linear-gradient(90deg,#a78bfa,#c4b5fd);border:0;border-radius:10px;color:#0b0314;cursor:pointer;margin:0 0 10px 0;font-weight:800">Start</button>
+      <button id="tx_progLikes"  style="width:100%;padding:8px;background:#2a1744;border:1px solid #5b21b6;border-radius:10px;color:#d9c6ff;cursor:pointer;margin:0 0 6px 0">Progress</button>
+      <button id="tx_beginLikes" style="width:100%;padding:10px;background:linear-gradient(90deg,#a78bfa,#c4b5fd);border:0;border-radius:12px;color:#0b0314;cursor:pointer;margin:0 0 12px 0;font-weight:900">Start</button>
 
+      <!-- Tweets -->
       <div style="margin:6px 0 4px 0; font-weight:800;color:#d9c6ff">Tweets (.js)</div>
-      <input type="file" id="tx_tweets" accept=".js" style="width:100%;margin-bottom:8px"/>
-      <div style="display:flex;gap:8px;margin:-4px 0 8px 0">
-        <button id="tx_startTweets" style="flex:1;padding:10px;background:#3b245e;border:0;border-radius:12px;color:#efe8ff;font-weight:900;cursor:pointer">Delete Tweets</button>
+      <input type="file" id="tx_tweets" accept=".js" style="width:100%;margin-bottom:6px"/>
+      <div style="display:flex;gap:6px;margin:2px 0 8px 0">
+        <input type="date" id="tx_tweetFrom" style="flex:1;background:#1a1030;color:#eee;border:1px solid #5b21b6;border-radius:8px;padding:6px"/>
+        <input type="date" id="tx_tweetTo"   style="flex:1;background:#1a1030;color:#eee;border:1px solid #5b21b6;border-radius:8px;padding:6px"/>
       </div>
-      <button id="tx_progTweets"  style="width:100%;padding:8px;background:#2a1744;border:1px solid #5b21b6;border-radius:10px;color:#d9c6ff;cursor:pointer;margin:-4px 0 6px 0">Progress</button>
-      <button id="tx_beginTweets" style="width:100%;padding:8px;background:linear-gradient(90deg,#a78bfa,#c4b5fd);border:0;border-radius:10px;color:#0b0314;cursor:pointer;margin:0 0 10px 0;font-weight:800">Start</button>
+      <button id="tx_progTweets"  style="width:100%;padding:8px;background:#2a1744;border:1px solid #5b21b6;border-radius:10px;color:#d9c6ff;cursor:pointer;margin:0 0 6px 0">Progress</button>
+      <button id="tx_beginTweets" style="width:100%;padding:10px;background:linear-gradient(90deg,#a78bfa,#c4b5fd);border:0;border-radius:12px;color:#0b0314;cursor:pointer;margin:0 0 12px 0;font-weight:900">Start</button>
 
+      <!-- DMs -->
       <div style="margin:6px 0 4px 0; font-weight:800;color:#d9c6ff">DM headers (.js)</div>
       <input type="file" id="tx_dm1" accept=".js" style="width:100%;margin-bottom:6px" placeholder="direct-message-headers.js"/>
-      <input type="file" id="tx_dm2" accept=".js" style="width:100%;margin-bottom:10px" placeholder="direct-message-group-headers.js (optional)"/>
-      <div style="display:flex;gap:8px;margin:-4px 0 8px 0">
-        <button id="tx_startDMs" style="flex:1;padding:10px;background:#3b245e;border:0;border-radius:12px;color:#efe8ff;font-weight:900;cursor:pointer">Delete DM Conversations</button>
+      <input type="file" id="tx_dm2" accept=".js" style="width:100%;margin-bottom:6px" placeholder="direct-message-group-headers.js (optional)"/>
+      <div style="display:flex;gap:6px;margin:2px 0 8px 0">
+        <input type="date" id="tx_dmFrom" style="flex:1;background:#1a1030;color:#eee;border:1px solid #5b21b6;border-radius:8px;padding:6px"/>
+        <input type="date" id="tx_dmTo"   style="flex:1;background:#1a1030;color:#eee;border:1px solid #5b21b6;border-radius:8px;padding:6px"/>
       </div>
-      <button id="tx_progDMs"  style="width:100%;padding:8px;background:#2a1744;border:1px solid #5b21b6;border-radius:10px;color:#d9c6ff;cursor:pointer;margin:-4px 0 6px 8px">Progress</button>
-      <button id="tx_beginDMs" style="width:100%;padding:8px;background:linear-gradient(90deg,#a78bfa,#c4b5fd);border:0;border-radius:10px;color:#0b0314;cursor:pointer;margin:0 0 10px 0;font-weight:800">Start</button>
+      <button id="tx_progDMs"  style="width:100%;padding:8px;background:#2a1744;border:1px solid #5b21b6;border-radius:10px;color:#d9c6ff;cursor:pointer;margin:0 0 6px 0">Progress</button>
+      <button id="tx_beginDMs" style="width:100%;padding:10px;background:linear-gradient(90deg,#a78bfa,#c4b5fd);border:0;border-radius:12px;color:#0b0314;cursor:pointer;margin:0 0 12px 0;font-weight:900">Start</button>
 
       <div style="height:10px;background:#2a1744;border-radius:999px;margin:14px 0 6px 0;overflow:hidden;border:1px solid #5b21b6">
         <div id="tx_bar" style="height:100%;width:0%;background:linear-gradient(90deg,#7c3aed,#a78bfa,#c4b5fd)"></div>
@@ -329,18 +359,13 @@
       <div id="tx_status" style="font-size:12px;color:#d9c6ff;text-align:center">0/0</div>
 
       <div style="margin-top:10px;color:#c7b8ff;font-size:12px;opacity:.85">
-        Note: anti-spam safeguards enabled (global pacing, random jitter, 429 cooling, resume-safe).
+        Anti-spam safeguards enabled (global pacing, random jitter, 429 cooling, resume-safe).
       </div>
     `;
     document.body.appendChild(wrap);
     injectFollowButton(byId('tx_follow_row'));
 
-    // Primary buttons
-    byId('tx_startLikes').onclick  = () => confirmAndRun('likes', runLikes);
-    byId('tx_startTweets').onclick = () => confirmAndRun('tweets', runTweets);
-    byId('tx_startDMs').onclick    = () => confirmAndRun('dms', runDMs);
-
-    // “Progress” + extra “Start” under it
+    // Only Progress + Start
     byId('tx_progLikes').onclick   = () => showProgress('likes');
     byId('tx_progTweets').onclick  = () => showProgress('tweets');
     byId('tx_progDMs').onclick     = () => showProgress('dms');
@@ -356,7 +381,7 @@
     byId('tx_status').textContent = `${done}/${total} (${pct}%)`;
   }
 
-  /************ Single “Are you sure?” confirm (backup prompt removed) ************/
+  /************ Confirm ************/
   async function confirmAndRun(kind, fn){
     const ans = await txModal(
       'Confirm deletion',
@@ -367,6 +392,7 @@
     fn();
   }
 
+  /************ Show Progress ************/
   async function showProgress(kind){
     const p = loadProgress(kind);
     const title = 'Progress';
@@ -390,18 +416,29 @@
     }
   }
 
-  /************ Runners (save/resume + jitter) ************/
+  /************ Runners (date range + save/resume + jitter) ************/
+  function parseArrayFromJSFileText(text) {
+    const s = text.indexOf('['), e = text.lastIndexOf(']');
+    if (s < 0 || e < 0 || e <= s) throw new Error('File format not recognized');
+    return JSON.parse(text.slice(s, e + 1));
+  }
+
   async function runLikes(resume=false) {
     try {
       let ids = [], fh = '';
+      const from = byId('tx_likeFrom').value ? new Date(byId('tx_likeFrom').value) : null;
+      const to   = byId('tx_likeTo').value   ? new Date(byId('tx_likeTo').value)   : null;
+
       if(resume){
         const p = loadProgress('likes'); if(!p){ uiToast('No progress.'); return; }
         ids = p.ids || []; fh  = p.fh || '';
       }else{
         const f = byId('tx_likes').files?.[0];
-        ids = await readIdsFromLikeJS(f); fh  = await fileHash(f);
+        ids = await readLikeIds(f, from, to);
+        const base = await fileHash(f);
+        fh  = `${base}|${from?.toISOString()||''}|${to?.toISOString()||''}`;
       }
-      if (!ids.length) return uiToast('No likes found in the file.');
+      if (!ids.length) return uiToast('No likes found in selected date range.');
       const p0 = loadProgress('likes'); let idx = (resume && p0 && p0.fh===fh) ? (p0.index||0) : 0;
 
       uiToast(`Starting Likes deletion: ${ids.length} (resume from ${idx})`);
@@ -419,14 +456,19 @@
   async function runTweets(resume=false) {
     try {
       let ids = [], fh = '';
+      const from = byId('tx_tweetFrom').value ? new Date(byId('tx_tweetFrom').value) : null;
+      const to   = byId('tx_tweetTo').value   ? new Date(byId('tx_tweetTo').value)   : null;
+
       if(resume){
         const p = loadProgress('tweets'); if(!p){ uiToast('No progress.'); return; }
         ids = p.ids || []; fh  = p.fh || '';
       }else{
         const f = byId('tx_tweets').files?.[0];
-        ids = await readIdsFromTweetsJS(f); fh  = await fileHash(f);
+        ids = await readTweetIds(f, from, to);
+        const base = await fileHash(f);
+        fh  = `${base}|${from?.toISOString()||''}|${to?.toISOString()||''}`;
       }
-      if (!ids.length) return uiToast('No tweets found in the file.');
+      if (!ids.length) return uiToast('No tweets found in selected date range.');
       const p0 = loadProgress('tweets'); let idx = (resume && p0 && p0.fh===fh) ? (p0.index||0) : 0;
 
       uiToast(`Starting Tweet deletion: ${ids.length} (resume from ${idx})`);
@@ -444,20 +486,23 @@
   async function runDMs(resume=false) {
     try {
       let ids = [], fh = '';
+      const from = byId('tx_dmFrom').value ? new Date(byId('tx_dmFrom').value) : null;
+      const to   = byId('tx_dmTo').value   ? new Date(byId('tx_dmTo').value)   : null;
+
       if(resume){
         const p = loadProgress('dms'); if(!p){ uiToast('No progress.'); return; }
         ids = p.ids || []; fh  = p.fh || '';
       }else{
         const f1 = byId('tx_dm1').files?.[0];
         const f2 = byId('tx_dm2').files?.[0];
-        const convA = await readConversationIdsFromDMHeaders(f1);
-        const convB = await readConversationIdsFromDMHeaders(f2);
+        const convA = await readDMConversationIds(f1, from, to);
+        const convB = await readDMConversationIds(f2, from, to);
         ids   = Array.from(new Set([...convA, ...convB]));
         const h1 = await fileHash(f1); const h2 = await fileHash(f2);
-        fh = `${h1}|${h2}`;
+        fh = `${h1}|${h2}|${from?.toISOString()||''}|${to?.toISOString()||''}`;
       }
 
-      if (!ids.length) return uiToast('No DM conversations found in header files.');
+      if (!ids.length) return uiToast('No DM conversations found in selected date range.');
       const p0 = loadProgress('dms'); let idx = (resume && p0 && p0.fh===fh) ? (p0.index||0) : 0;
 
       uiToast(`Starting DM deletion: ${ids.length} (resume from ${idx})`);
